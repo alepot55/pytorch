@@ -24,6 +24,7 @@ R = TypeVar("R")
 
 _OpCondFn = Callable[P, bool]
 _OpImplFn = Callable[P, R]
+_OpAvailabilityCheck = Callable[[], bool]
 
 
 def _unconditional_is_masked() -> bool:
@@ -69,6 +70,7 @@ class _OverrideNode:
     node_id: str
     unconditional_override: bool = False
     active: bool = True
+    availability_check: _OpAvailabilityCheck | None = None
 
 
 UserOrderingFn = Callable[[str, str, list[_OverrideNode]], list[_OverrideNode]]
@@ -637,6 +639,7 @@ def register_op_override(
     cond: _OpCondFn | None,
     impl: _OpImplFn,
     *,
+    availability_check: _OpAvailabilityCheck | None = None,
     allow_multiple_override: bool = False,
     unconditional_override: bool = False,
 ) -> None:
@@ -653,6 +656,8 @@ def register_op_override(
         cond: Predicate choosing whether `impl` applies to a given call. May
             be None if `unconditional_override=True`.
         impl: Implementation function for the override
+        availability_check: Optional readiness check for conditional overrides.
+            Eager dispatch skips the override when this returns False.
         allow_multiple_override: Allow overriding an existing override
         unconditional_override: This impl IS the op's implementation, not a
             faster route to the same answer. It doesn't have a fallback and
@@ -684,6 +689,9 @@ def register_op_override(
             raise ValueError("cond must be provided unless unconditional_override=True")
         cond = _always_true
 
+    if unconditional_override:
+        availability_check = None
+
     key = (op_symbol, dispatch_key)
 
     global _graphs, _node_id_counter
@@ -704,6 +712,7 @@ def register_op_override(
             dispatch_key=dispatch_key,
             cond_fn=cond,
             impl_fn=impl,
+            availability_check=availability_check,
             unconditional_override=unconditional_override,
             node_id=node_id,
         )
@@ -917,7 +926,7 @@ def _register_overrides_from_graph(
     """
     lib = _get_or_create_library(dispatch_key)
 
-    cond_impl: list[tuple[_OpCondFn, str]] = []
+    candidates: list[tuple[_OpCondFn, str, _OpAvailabilityCheck | None]] = []
 
     # node.node_id is minted once at `register_op_override` time and is
     # stable across reorder / deregister / reenable -- never regenerate it
@@ -929,7 +938,7 @@ def _register_overrides_from_graph(
 
         if enable:
             _register_node_impl(lib, node, dispatch_key)
-            cond_impl.append((node.cond_fn, node.node_id))
+            candidates.append((node.cond_fn, node.node_id, node.availability_check))
             node.active = True
         else:
             node.active = False
@@ -937,14 +946,14 @@ def _register_overrides_from_graph(
     overload = _resolve_aten_overload(op_symbol)
 
     # Tear down any existing aten override so either (a) the op cleanly
-    # reverts to native aten (empty cond_impl), or (b) the subsequent
+    # reverts to native aten (no candidates), or (b) the subsequent
     # `get_kernel` call returns the native kernel rather than a stale
     # previously-installed router.
     _destroy_aten_override(op_symbol, dispatch_key)
 
     # If no active conds remain for this (op, key), leave the native op
     # behavior intact and drop any decomp table entry.
-    if not cond_impl:
+    if not candidates:
         if overload is not None:
             _native_decomp_overrides.pop(overload, None)
         return
@@ -957,18 +966,9 @@ def _register_overrides_from_graph(
     # calls bmm, which would route back to us).
     fallback_kernel = torch.library.get_kernel(f"aten::{op_symbol}", dispatch_key)
 
-    # Build the router closures. Both share a first-match-wins loop over
-    # `cond_impl`; they differ only in
-    #   (a) whether cond exceptions fail loudly or silently, and
-    #   (b) what to do when no cond matches.
-    #
-    # Eager routers run on real tensors where cond exceptions indicate a
-    # genuine bug; missing a match falls back to the captured native kernel.
-    #
-    # Compile/export routers run under FakeTensor where some predicates are
-    # undefined (e.g. _is_cow_tensor), so we swallow cond exceptions and
-    # treat them as non-matches. On no-match we return NotImplemented so
-    # Inductor reuses the default lowering rather than recursing.
+    # Eager propagates predicate errors, checks availability, and falls back to
+    # ATen. Compile/export treats predicate errors as misses, skips availability,
+    # and returns NotImplemented to use the default lowering.
     _NO_MATCH = object()  # sentinel; impl return values of None would be valid outputs
 
     # Calls served by an AOT kernel embedded in the aten implementation must decline
@@ -979,11 +979,17 @@ def _register_overrides_from_graph(
 
     coverage = aot_manifest.get_coverage(op_symbol, dispatch_key)
 
-    def _dispatch(args, kwargs, swallow_cond_exceptions: bool):
+    def _dispatch(
+        args,
+        kwargs,
+        *,
+        swallow_cond_exceptions: bool,
+        check_availability: bool,
+    ):
         # covers() degrades exceptions to "uncovered", so this is safe on FakeTensors.
         if coverage is not None and coverage.covers(args, kwargs):
             return _NO_MATCH
-        for cond, impl_name in cond_impl:
+        for cond, impl_name, availability_check in candidates:
             try:
                 matched = cond(*args, **kwargs)
             except Exception:
@@ -991,7 +997,14 @@ def _register_overrides_from_graph(
                     raise
                 continue
             if matched:
-                return getattr(torch.ops._native, impl_name)(*args, **kwargs)
+                if (
+                    check_availability
+                    and availability_check is not None
+                    and not availability_check()
+                ):
+                    continue
+                native_impl = getattr(torch.ops._native, impl_name)
+                return native_impl(*args, **kwargs)
         return _NO_MATCH
 
     def eager_router(
@@ -1036,13 +1049,23 @@ def _register_overrides_from_graph(
             finally:
                 _router_active.on = False
 
-        result = _dispatch(args, kwargs, swallow_cond_exceptions=False)
+        result = _dispatch(
+            args,
+            kwargs,
+            swallow_cond_exceptions=False,
+            check_availability=True,
+        )
         if result is _NO_MATCH:
             return _fallback.call_boxed(keyset, *args, **kwargs)
         return result
 
     def compile_router(*args, **kwargs):
-        result = _dispatch(args, kwargs, swallow_cond_exceptions=True)
+        result = _dispatch(
+            args,
+            kwargs,
+            swallow_cond_exceptions=True,
+            check_availability=False,
+        )
         if result is _NO_MATCH:
             return NotImplemented
         return result

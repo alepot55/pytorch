@@ -137,6 +137,7 @@ class TestRegistry(TestCase):
         self.assertEqual(node.dispatch_key, "CPU")
         self.assertEqual(node.cond_fn, cond_fn)
         self.assertEqual(node.impl_fn, impl_fn)
+        self.assertIsNone(node.availability_check)
         self.assertFalse(node.unconditional_override)
         self.assertTrue(node.active)
 
@@ -449,6 +450,25 @@ class TestRegistryRuntime(TestCase):
         out = torch.ops.aten.mul.Tensor(a, b)
         self.assertTrue(torch.equal(out, torch.tensor([8.0, 15.0])))
         self.assertFalse(sentinel_called[0])
+
+    def test_availability_check_falls_through(self):
+        impl = MagicMock(side_effect=AssertionError("implementation was called"))
+        self.registry.register_op_override(
+            "test_dsl",
+            "aten",
+            "mul.Tensor",
+            "CPU",
+            lambda a, b: True,
+            impl,
+            availability_check=lambda: False,
+        )
+        self._install("mul.Tensor", "CPU")
+
+        self.assertEqual(
+            torch.ops.aten.mul.Tensor(torch.tensor([2.0]), torch.tensor([4.0])).item(),
+            8.0,
+        )
+        impl.assert_not_called()
 
     def test_compile_session_flag_falls_through_without_recursion(self):
         """The eager router must not redispatch to its own aten override when
@@ -846,18 +866,22 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue(torch.equal(mul(a, b), torch.tensor([8.0, 15.0])))
 
     def test_fake_tensor_shape_inference(self):
-        """FakeTensorMode must shape-infer through `_native::<id>` via the
-        registered fake kernel (which redispatches to the aten meta).
-        """
+        """FakeTensor skips the eager implementation and availability check."""
 
         def cond(*a, **k):
             return True
 
-        def impl(a, b):
-            return torch.full_like(a, 1.0)
+        impl = MagicMock(side_effect=AssertionError("implementation ran"))
+        availability_check = MagicMock(side_effect=AssertionError("guard ran"))
 
         self.registry.register_op_override(
-            "test_dsl", "aten", "mul.Tensor", "CPU", cond, impl
+            "test_dsl",
+            "aten",
+            "mul.Tensor",
+            "CPU",
+            cond,
+            impl,
+            availability_check=availability_check,
         )
         self._install("mul.Tensor", "CPU")
 
@@ -879,6 +903,7 @@ class TestRegistryRuntime(TestCase):
             call_count[0] += 1
             return torch.full_like(a, 5.0)
 
+        availability_check = MagicMock(side_effect=AssertionError("guard ran"))
         self.registry.register_op_override(
             "test_dsl",
             "aten",
@@ -886,6 +911,7 @@ class TestRegistryRuntime(TestCase):
             "CPU",
             None,
             impl,
+            availability_check=availability_check,
             unconditional_override=True,
         )
         self._install("mul.Tensor", "CPU")
@@ -902,6 +928,7 @@ class TestRegistryRuntime(TestCase):
             )
         )
         self.assertEqual(call_count[0], 2)
+        availability_check.assert_not_called()
 
     # torch.equal, not assertEqual, below: assertEqual computes its tolerances with
     # tensor*float, which this UNCONDITIONAL override on mul.Tensor also catches, so

@@ -145,7 +145,18 @@ class TestNativeDecompTable(TestCase):
 
     def _export_add(self, cond, impl):
         """Export a module that calls `x + y`; decompose with the native table."""
-        self._register("add.Tensor", cond, impl)
+        self.registry.register_op_override(
+            self.dsl_name,
+            "aten",
+            "add.Tensor",
+            "CPU",
+            cond,
+            impl,
+            availability_check=lambda: self.fail(
+                "availability check ran during export"
+            ),
+        )
+        self.registry._register_all_overrides()
 
         class M(torch.nn.Module):
             def forward(self, x, y):
@@ -249,7 +260,7 @@ class TestNativeDecompTable(TestCase):
     # ------------------------------------------------------------------
 
     def test_export_with_matching_cond_routes_to_native(self):
-        """When cond matches, run_decompositions rewrites aten call to _native."""
+        """Export skips availability checks."""
         ep = self._export_add(_always_true, _make_fill_impl(7))
         self.assertGraphRoutedToNative(ep)
 

@@ -68,6 +68,23 @@ def runtime_version() -> None | Version:
 
 
 @functools.cache
+def _try_initialize_driver() -> bool:
+    """Initialize and cache Triton's driver."""
+    try:
+        from triton.runtime import driver
+
+        _ = driver.active
+    except Exception:
+        log.info(
+            "Triton driver initialization failed; "
+            "skipping conditional Triton overrides",
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+@functools.cache
 def _version_is_sufficient() -> bool:
     _, version = _check_runtime_available()
 
@@ -127,6 +144,7 @@ def register_op_override(
         dispatch_key,
         cond,
         impl,
+        availability_check=_try_initialize_driver,
         allow_multiple_override=allow_multiple_override,
         unconditional_override=unconditional_override,
     )

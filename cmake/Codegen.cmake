@@ -71,7 +71,7 @@ if(INTERN_BUILD_ATEN_OPS)
   endif(MSVC)
 
   if(NOT MSVC AND NOT "${CMAKE_C_COMPILER_ID}" MATCHES "Clang")
-    set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/MapAllocator.cpp PROPERTIES COMPILE_FLAGS "-fno-openmp")
+    set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/../aten/src/ATen/MapAllocator.cpp PROPERTIES COMPILE_OPTIONS "-fno-openmp")
   endif()
 
   file(GLOB_RECURSE all_python "${CMAKE_CURRENT_LIST_DIR}/../torchgen/*.py")
@@ -136,9 +136,7 @@ if(INTERN_BUILD_ATEN_OPS)
           endif()
         endif()
       endforeach()
-      list(JOIN _file_compile_flags " " _file_compile_flags)
-
-      set_source_files_properties(${file} PROPERTIES COMPILE_FLAGS "${_file_compile_flags}")
+      set_source_files_properties(${file} PROPERTIES COMPILE_OPTIONS "${_file_compile_flags}")
     endfunction()
 
     _BUILD_FOR_ADDITIONAL_ARCHS(

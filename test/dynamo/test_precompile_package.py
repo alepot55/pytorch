@@ -44,6 +44,7 @@ from torch._dynamo.source import (
 )
 from torch._dynamo.types import GuardFilterEntry
 from torch._guards import ChainedSource, Guard
+from torch.compiler._precompile_types import GuardFact
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -1903,15 +1904,21 @@ class TestPrecompileSession(torch._inductor.test_case.TestCase):
         entries = self._guard_entries(_SessionStep(), torch.randn(3, 4))
         base = default_guard_filter_fn(entries)
         self.assertIn(True, base)
-        keep_all = _compose_with_default(lambda e: [True] * len(e))
-        self.assertEqual(list(keep_all(entries)), list(base))
-        keep_none = _compose_with_default(lambda e: [False] * len(e))
-        self.assertEqual(list(keep_none(entries)), [False] * len(entries))
+        keep_all, reported = _compose_with_default(lambda e: [True] * len(e))(entries)
+        self.assertEqual(list(keep_all), list(base))
+        # The default's own decisions come back with the composition, which is
+        # what lets the recorder judge a drop without running it again.
+        self.assertEqual(list(reported), list(base))
+        keep_none, _ = _compose_with_default(lambda e: [False] * len(e))(entries)
+        self.assertEqual(list(keep_none), [False] * len(entries))
+        # No custom filter at all: the default's decisions ARE the composition.
+        composed, reported = _compose_with_default(None)(entries)
+        self.assertEqual(list(composed), list(base))
+        self.assertEqual(list(reported), list(base))
         # A custom filter cannot re-admit what the default dropped.
         dropped = [i for i, kept in enumerate(base) if not kept]
         self.assertTrue(dropped)
-        widened = _compose_with_default(lambda e: [True] * len(e))(entries)
-        self.assertFalse(any(widened[i] for i in dropped))
+        self.assertFalse(any(keep_all[i] for i in dropped))
 
     def test_compose_with_default_refuses_a_wrong_length_decision_list(self):
         from torch._dynamo.precompile_package import _compose_with_default
@@ -2054,7 +2061,332 @@ class TestPrecompileSession(torch._inductor.test_case.TestCase):
             _entry_fn_of(3)
 
 
+class _SessionReadsAttr(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
+        self.scale = 2
+
+    def forward(self, x):
+        return self.lin(x) * self.scale
+
+
+def _drop_scale(entries):
+    return ["scale" not in e.name for e in entries]
+
+
+def _session_branches(x, flag):
+    return x * 2 if flag else x + 1
+
+
+class _ReprRaises:
+    def __repr__(self):
+        raise RuntimeError("no repr for you")
+
+
+class _ReprRaisesStr(str):
+    """A scalar _plain_value does render, whose repr raises anyway."""
+
+    __slots__ = ()
+
+    def __repr__(self):
+        raise RuntimeError("no repr for you")
+
+
+def _fact(guard_type, source, code=(), value="", enforced=True):
+    return GuardFact(
+        guard_type=guard_type,
+        source=source,
+        code=code,
+        value=value,
+        enforced=enforced,
+    )
+
+
+class TestPrecompileSessionSummary(torch._inductor.test_case.TestCase):
+    def setUp(self):
+        super().setUp()
+        torch._dynamo.reset()
+
+    def _session(self, fn, **kwargs):
+        from torch._dynamo.precompile_package import precompile_capture
+
+        kwargs.setdefault("backend", "eager")
+        kwargs.setdefault("dynamic", False)
+        return precompile_capture(fn, **kwargs)
+
+    def _gate(self, session, **flags):
+        flags = {
+            "require_complete": True,
+            "require_no_risky_drops": True,
+            "require_no_dropped_guards": False,
+            **flags,
+        }
+        return session._gated_summary(**flags)
+
+    def _risky_session(self):
+        """A capture whose custom filter drops self.scale, so the drop is risky."""
+        session = self._session(_SessionReadsAttr(), guard_filter_fn=_drop_scale)
+        with session as cap:
+            cap(torch.randn(2, 4))
+        return session
+
+    def _report(self, session):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inv.txt")
+            session.write_invariants(path)
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+
+    def test_summary_counts_frames_variants_and_guards(self):
+        model = _SessionReadsAttr()
+        session = self._session(model)
+        with session as cap:
+            cap(torch.randn(2, 4))
+            cap(torch.randn(3, 4))
+        summary = session.summary()
+        self.assertEqual(summary.frames, 1)
+        self.assertEqual(summary.guarded_codes, 2)
+        self.assertEqual(summary.backend_graphs, 2)
+        self.assertEqual(summary.bypassed, ())
+        self.assertEqual(summary.capture_errors, ())
+        self.assertTrue(summary.complete)
+        self.assertIn("TENSOR_MATCH", summary.kept_guard_types)
+        self.assertIn("MODULE_MATCH", summary.dropped_guard_types)
+        self.assertEqual(summary.risky_dropped_guards, ())
+        self.assertEqual(summary.policy_dropped_guards, ())
+
+    def test_a_custom_filter_composes_with_the_default_and_its_drops_are_risky(self):
+        session = self._risky_session()
+        summary = session.summary()
+        self.assertTrue(any("scale" in name for _, name in summary.dropped_guards))
+        self.assertTrue(
+            any("scale" in name for _, name in summary.risky_dropped_guards)
+        )
+        self.assertIn("MODULE_MATCH", summary.dropped_guard_types)
+        self.assertTrue(
+            any("scale" in name for _, name, _ in summary.dropped_guard_code)
+        )
+
+    def test_invariants_classify_guards_across_variants(self):
+        session = self._session(_SessionReadsAttr())
+        with session as cap:
+            cap(torch.randn(2, 4))
+            cap(torch.randn(3, 4))
+        (frame,) = session.invariants()
+        self.assertEqual(frame.frame, "forward")
+        self.assertEqual(frame.variants, 2)
+        varying = {(f.guard_type, f.source) for f in frame.varying}
+        self.assertIn(("TENSOR_MATCH", "x"), varying)
+        self.assertTrue(any("scale" in f.source for f in frame.invariant))
+
+    def test_invariants_report_is_written_on_a_clean_exit_only(self):
+        model = _SessionReadsAttr()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inv.txt")
+            with self._session(model, invariants=path) as cap:
+                cap(torch.randn(2, 4))
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("frame forward", text)
+            self.assertIn("invariant", text)
+            os.unlink(path)
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                with self._session(model, invariants=path) as cap:
+                    cap(torch.randn(2, 4))
+                    raise RuntimeError("boom")
+            self.assertFalse(os.path.exists(path))
+
+    def test_gates_refuse_an_empty_or_failed_capture(self):
+        session = self._session(_SessionReadsAttr())
+        with session:
+            pass
+        with self.assertRaisesRegex(PackageError, "captured no compiled code"):
+            self._gate(session)
+        self.assertEqual(self._gate(session, require_complete=False).guarded_codes, 0)
+
+        session = self._session(_session_raises)
+        with session as cap:
+            with self.assertRaisesRegex(ValueError, "boom"):
+                cap(torch.ones(2), True)
+        with self.assertRaisesRegex(PackageError, "incomplete because capture raised"):
+            self._gate(session)
+
+    def test_gates_refuse_risky_and_plain_drops_as_asked(self):
+        session = self._risky_session()
+        with self.assertRaisesRegex(PackageError, "can affect dispatch"):
+            self._gate(session)
+        with self.assertRaisesRegex(PackageError, "were not serialized"):
+            self._gate(
+                session, require_no_risky_drops=False, require_no_dropped_guards=True
+            )
+        self.assertTrue(self._gate(session, require_no_risky_drops=False).complete)
+
+    def test_an_accepted_risky_drop_is_warned_with_what_it_gave_up(self):
+        session = self._risky_session()
+        with self.assertLogs(
+            "torch._dynamo.precompile_package", level="WARNING"
+        ) as logs:
+            self._gate(session, require_no_risky_drops=False)
+        message = "\n".join(logs.output)
+        self.assertIn("dropped guard(s) can affect dispatch", message)
+        self.assertIn("COULD BEAR ON SHAPE", message)
+        self.assertIn("scale", message)
+        self.assertIn("require_no_risky_drops=False", message)
+
+    def test_two_calls_with_the_same_shape_are_not_a_varying_tensor(self):
+        # The fact's value is a guard comparison, not a data comparison: same
+        # dtype and shape, different elements, so the TENSOR_MATCH held across
+        # both variants and only the branch flag tells them apart.
+        session = self._session(_session_branches)
+        with session as cap:
+            cap(torch.randn(2, 4), True)
+            cap(torch.randn(2, 4), False)
+        (frame,) = session.invariants()
+        self.assertEqual(frame.variants, 2)
+        varying = {(f.guard_type, f.source) for f in frame.varying}
+        invariant = {(f.guard_type, f.source) for f in frame.invariant}
+        self.assertIn(("TENSOR_MATCH", "x"), invariant)
+        self.assertNotIn(("TENSOR_MATCH", "x"), varying)
+        self.assertTrue(any(source == "flag" for _, source in varying))
+        self.assertNotIn(("TENSOR_MATCH", "x"), set(session.summary().dropped_guards))
+
+    def test_a_dropped_slot_keeps_the_first_rendering(self):
+        # One rendering per slot, whatever the variants: see
+        # PrecompileSummary.dropped_guard_code.
+        session = self._session(_SessionReadsAttr())
+        slot = ("EQUALS_MATCH", "n")
+        session._record_dropped_code(slot, ["L['n'] == 3"])
+        session._record_dropped_code(slot, ["L['n'] == 4"])
+        self.assertEqual(session._dropped_guard_code[slot], "L['n'] == 3")
+        session._record_dropped_code(("TENSOR_MATCH", "x"), [])
+        self.assertNotIn(("TENSOR_MATCH", "x"), session._dropped_guard_code)
+
+    def test_a_guarded_value_renders_as_its_shape_or_its_type_only(self):
+        def rendered(value, has_value=True):
+            entry = _entry(LocalSource("x"), value, "TENSOR_MATCH")
+            return precompile_package._plain_value(
+                dataclasses.replace(entry, has_value=has_value)
+            )
+
+        self.assertEqual(rendered(torch.ones(2, 4)), "torch.float32 (2, 4) cpu")
+        self.assertEqual(rendered(3), "3")
+        self.assertEqual(rendered(True), "True")
+        self.assertEqual(rendered(None), "None")
+        self.assertEqual(rendered("small"), "'small'")
+        # A long string is the data itself, and any other object renders as its
+        # type: neither a prompt nor a tensor's elements reach the report.
+        self.assertEqual(rendered("x" * 100), "<str>")
+        self.assertEqual(rendered(_ReprRaises()), "<_ReprRaises>")
+        self.assertEqual(rendered(torch.nn.ReLU()), "<ReLU>")
+        self.assertEqual(rendered(3, has_value=False), "")
+        # Reading the value is fallible, and a failure here would otherwise
+        # propagate out of the guard filter and kill the compile.
+        self.assertEqual(rendered(_ReprRaisesStr("boom")), "<unavailable>")
+
+    @parametrize(
+        "raw,masked",
+        [
+            ("<mypkg.Cfg object at 0x7F88c01a2d90>", "<mypkg.Cfg object at <addr>>"),
+            (
+                "___check_obj_id(L['x'], 140234567), type=<class 'int'>",
+                "___check_obj_id(L['x'], <id>), type=<class 'int'>",
+            ),
+            ("G['__builtins_dict___14']['len']", "G['__builtins_dict___<n>']['len']"),
+            ("__compiled_fn_3_0(L['x'])", "__compiled_fn_<n>(L['x'])"),
+            ("G['_140234567891_c0'].weight", "G['_<id>_c<n>'].weight"),
+            (
+                "top_saved_tensors_hooks ids == (11, 12)",
+                "top_saved_tensors_hooks ids == (<ids>)",
+            ),
+            # Narrower than an address: a real name, left alone.
+            ("G['_12345_c0'].weight", "G['_12345_c0'].weight"),
+            ("self.eps", "self.eps"),
+        ],
+    )
+    def test_normalize_masks_only_what_changes_run_to_run(self, raw, masked):
+        from torch._dynamo.precompile_package import _normalize
+
+        self.assertEqual(_normalize(raw), masked)
+        # Idempotent, or a re-normalized slot would spell itself differently.
+        self.assertEqual(_normalize(masked), masked)
+
+    def test_the_rendered_report_is_stable_and_names_every_class(self):
+        x2 = _fact("TENSOR_MATCH", "x", value="torch.float32 (2, 4) cpu")
+        x3 = _fact("TENSOR_MATCH", "x", value="torch.float32 (3, 4) cpu")
+        scale = _fact("EQUALS_MATCH", "self.scale", ("L['self'].scale == 2",), "2")
+        act = _fact(
+            "MODULE_MATCH",
+            "self.act",
+            ("___check_obj_id(L['self'].act, <id>)",),
+            "<ReLU>",
+            enforced=False,
+        )
+        ambient = _fact("GLOBAL_STATE", "", ("___check_global_state()",))
+        session = self._session(_SessionReadsAttr())
+        forward = ("forward", "/pkg/m.py", 7, 1)
+        session._guard_sets = {
+            ("resume_in_forward", "/pkg/m.py", 19, 2): [frozenset({scale})],
+            forward: [frozenset({x2, scale, act}), frozenset({x3, scale, act})],
+        }
+        session._undetermined = {forward: {ambient}}
+        self.assertExpectedInline(
+            self._report(session),
+            """\
+# precompile invariants for _SessionReadsAttr
+#
+# Conditions that held in EVERY compiled variant of a frame. A call
+# violating one cannot be served by any graph in this artifact, so
+# these are the preconditions the artifact is only valid under.
+# 'varies' lists what differed between variants -- those are what
+# distinguish one compiled graph from another, not preconditions.
+# 'unknown' lists guards whose check this report cannot model, so it
+# cannot say whether they held across variants. Treat them as
+# neither: they may or may not be preconditions.
+#
+# enforced = the guard is serialized and rechecked when the artifact
+#            is loaded.
+# dropped  = it was not serialized, so it is a precondition
+#            NOTHING checks at serving time. See
+#            PrecompileSummary.dropped_guards.
+#
+# 2 frame(s), 3 compilation(s)
+# NOTE: some frames were compiled once, so their invariants are just every guard. Exercise more variants for a real diff.
+
+frame forward (m.py:7)  2 variant(s), 2 invariant, 2 varying, 1 undetermined
+  invariant [dropped ] ___check_obj_id(L['self'].act, <id>) <ReLU> on self.act
+  invariant [enforced] L['self'].scale == 2 2 on self.scale
+  varies    [enforced] <TENSOR_MATCH> torch.float32 (2, 4) cpu on x
+  varies    [enforced] <TENSOR_MATCH> torch.float32 (3, 4) cpu on x
+  unknown   [enforced] ___check_global_state()
+
+frame resume_in_forward (m.py:19)  1 variant(s), 1 invariant, 0 varying, 0 undetermined
+  invariant [enforced] L['self'].scale == 2 2 on self.scale
+""",
+        )
+
+    def test_the_report_is_written_as_utf8_whatever_the_locale(self):
+        session = self._session(_SessionReadsAttr())
+        name = "self.gewichtsma\u00df"
+        session._guard_sets = {
+            ("forward", "/pkg/m.py", 7, 1): [frozenset({_fact("EQUALS_MATCH", name)})]
+        }
+        real_open = open
+
+        def ascii_default_open(file, mode="r", **kwargs):
+            # An ASCII locale, as a container often has: without an explicit
+            # encoding= the write would raise and leave the file truncated.
+            if kwargs.get("encoding") is None and "b" not in mode:
+                kwargs["encoding"] = "ascii"
+            return real_open(file, mode, **kwargs)
+
+        with mock.patch("builtins.open", ascii_default_open):
+            report = self._report(session)
+        self.assertIn(name, report)
+
+
 instantiate_parametrized_tests(TestPrecompilePackage)
+instantiate_parametrized_tests(TestPrecompileSessionSummary)
 
 
 if __name__ == "__main__":

@@ -4,41 +4,109 @@ artifact holding every frame Dynamo produces while the caller's calls run --
 the entry frame, the ``torch_dynamo_resume_in_*`` continuations graph breaks
 create, and the recompiled variants of each -- stored through CompilePackage
 (``torch/_dynamo/package.py``), a low-level component not meant to be used
-directly. It is not ``torch.compiler.precompile``, the ahead-of-time capture
-API this repository already has (``torch/_precompile.py``), which does not call
-into this module; nor ``torch._dynamo.config.caching_precompile``, which caches
+directly, the multi-graph counterpart of
+``torch.compile(fn, fullgraph=True).aot_compile(...)``. It is not
+``torch.compiler.precompile``, the ahead-of-time capture API this repository
+already has (``torch/_precompile.py``), which does not call into this module
+yet; nor ``torch._dynamo.config.caching_precompile``, which caches
 ``torch.compile`` artifacts transparently without an explicit capture and, when
 set, wraps every guard filter, this module's included (see
 ``default_guard_filter_fn``).
 
 ``default_guard_filter_fn`` is the guard filter a capture's serialized guards
-are written under. The rest of this module, added by the following commits of
-this stack, is the guard tooling that reports what that filter dropped and the
-configuration a capture runs under. The filter lives here, with that tooling,
-rather than beside the serializer's pre-check in ``guards.py``: it is the
-capture's policy over that pre-check, not part of it. Everything here is
-internal; the filter alone is unprefixed because the capture session passes it
-as the default a caller may name. The multi-graph Dynamo capture session that
-drives it is a follow-up stack; nothing under ``torch/`` calls into this module
-yet.
+are written under. Around it sits the guard tooling that reports what that
+filter dropped and the configuration a capture runs under. The filter lives
+here, with that tooling, rather than beside the serializer's pre-check in
+``guards.py``: it is the capture's policy over that pre-check, not part of it.
+Everything here is internal; the filter alone is unprefixed because the capture
+session passes it as the default a caller may name. ``PrecompileSession``, the
+multi-graph Dynamo capture session that drives it, is added here; the
+``torch.compiler.precompile.capture(..., tracer=DynamoTracer())`` entry point
+that reaches it lands later in this stack, so nothing under ``torch/`` calls
+into the session yet.
+
+Capture is by execution, and the caller drives it: the session hands back a
+callable, the caller invokes it with real inputs inside their own loop, and
+every frame Dynamo produces is recorded. Runtime guards stay intact during
+capture; ``guard_filter_fn`` applies only to the serialized copy.
+
+    with torch.compiler.precompile.capture(
+        step, artifact_path="m.py", cache_path="m.cache", backend="inductor"
+    ) as cap:
+        y1 = cap(model, x1)  # runs step(model, x1), returns its result
+        y2 = cap(model, x2)  # exercises another variant
+
+    # later, in a fresh process
+    compiled = torch.compiler.precompile.load("m.py", "m.cache")
+    with compiled, torch.no_grad():
+        compiled(model, x1)
+
+The caller's calls ARE the capture: each ``cap(...)`` runs the callable for
+real, returns its result, and records every frame, break continuation and
+guarded variant it exercises.
+
+Calls run with the grad mode the caller sets -- capture does not force
+``no_grad()`` or ``enable_grad()``. ``training=True`` lowers the backward
+eagerly so the artifact carries one and a served output can be backpropagated.
+No loss is needed for that: the joint trace synthesizes tangents from the
+forward outputs' own metadata.
+
+Live capture retains every runtime guard, so later examples trigger the same
+recompilations as ordinary ``torch.compile``. ``guard_filter_fn`` applies only
+to the serialized copy.
+
+Capture is by execution: a resume function only exists once the frame ahead of
+it has actually run, so every variant must be exercised. Whatever you do not
+run is not in the artifact: it covers what was observed, not every possible
+input to the callable.
+
+Know these before relying on an artifact in production:
+
+* An inference artifact is the default: the caller runs the calls under
+  ``torch.no_grad()``. For a training artifact pass ``training=True``, which
+  traces with grad on and lowers the backward eagerly -- without it, AOTAutograd
+  defers the backward to the first ``.backward()`` call, so a grad-enabled
+  capture that never makes one records no backends and cannot be written.
+* A non-tensor argument, and any value that crosses a graph break, is guarded
+  by equality, so an int/bool/str argument or a break coming from ``.item()``
+  yields an artifact that only serves calls reproducing those exact values.
+  Exercise every value you need to serve with a ``cap(...)`` call, or expect
+  poor coverage on new data. ``dynamic=True`` helps with shapes but not with
+  pinned values.
+* Identity guards cannot be serialized, so precompiling gives up on noticing
+  that a guarded object was rebound. Every model drops them, so a capture that
+  refused every drop would refuse essentially every real artifact.
+* Some models do not capture yet. For example, T5 raises ``PackageError: Cannot
+  find module for code <code object __init__`` from ``_get_code_source``, which
+  is byte-identical to base and which plain ``caching_precompile`` also raises.
+* The model must live in an importable module. Source is checksummed, so a
+  class defined in ``__main__`` or a REPL cannot be loaded elsewhere.
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import importlib.machinery
 import os
 import site
 import sys
 import sysconfig
+import threading
 import types
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
+import torch
+import torch._functorch.config as functorch_config
 from torch._guards import ChainedSource
 from torch.utils._config_module import ConfigModule
 
 from .aot_compile import _BUILTINS_DICT_PREFIX, _IMPORT_ALIAS_PREFIX
+from .convert_frame import CatchErrorsWrapper
+from .exc import PackageError
 from .guards import CheckFunctionManager
+from .package import CompilePackage
 from .source import (
     AttrSource,
     DictGetItemSource,
@@ -50,11 +118,25 @@ from .source import (
 
 if TYPE_CHECKING:
     import traceback
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from torch._guards import Source
 
-    from .types import GuardFilterEntry
+    from .convert_frame import ConvertFrameReturn
+    from .eval_frame import OptimizeContext
+    from .package import _BackendId
+    from .types import CacheEntry, DynamoFrameType, GuardFilterEntry
+    from .variables.builder import FrameStateSizeEntry
+
+
+# Not a public surface -- see the module docstring. This exists so `from ...
+# import *` in a debugging session pulls the entry points rather than every
+# private helper, and so linters do not flag them as unused.
+__all__ = [
+    "default_guard_filter_fn",
+    "PrecompileSession",
+    "precompile_capture",
+]
 
 
 def default_guard_filter_fn(guard_entries: Sequence[GuardFilterEntry]) -> list[bool]:
@@ -765,4 +847,427 @@ def _reads_a_builtin(source: Source, value: object) -> bool:
         )
         and _owning_module(value) == "builtins"
         and getattr(value, "__name__", None) == source.index
+    )
+
+
+# Built once: config.patch() allocates a class and a ContextVar each time it is
+# called, and this runs on every frame Dynamo compiles for a package.
+_ALLOW_EMPTY_GRAPHS = torch._dynamo.config._make_closure_patcher(
+    allow_empty_graphs=True
+)
+
+
+# Depth per context so overlapping sessions on one thread patch once and
+# restore once; a worker thread starts at zero and patches for itself.
+_CAPTURE_CONFIG_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_CAPTURE_CONFIG_DEPTH", default=0
+)
+
+
+_CAPTURE_CONFIG_STACK: contextvars.ContextVar[contextlib.ExitStack | None] = (
+    contextvars.ContextVar("_CAPTURE_CONFIG_STACK", default=None)
+)
+
+
+@contextlib.contextmanager
+def _capture_config(training: bool) -> Iterator[None]:
+    # Backends serialize into the artifact rather than the process-local
+    # inductor cache. AOTAutograd lowers the backward lazily on the first
+    # .backward(), so a training capture that never makes one forces it eager.
+    depth = _CAPTURE_CONFIG_DEPTH.get()
+    if depth == 0:
+        functorch_patch: dict[str, Any] = {
+            "bundled_autograd_cache": True,
+            # AOTAutogradCache refuses to KEY a graph it cannot address soundly
+            # -- a graph calling anything outside its allowlist -- and a refusal
+            # means it never saves, so the bundled artifact precompile needs is
+            # never recorded and the capture ends with nothing to serialize.
+            # That gate asks whether the key tells this graph's behaviour apart
+            # from another's, which a precompile artifact does not depend on: it
+            # is addressed by backend id and pinned to one torch build, so fall
+            # back to a nonce key rather than declining, as
+            # torch._dynamo.aot_compile and aot_compile_joint_with_descriptors
+            # already do.
+            "bypass_autograd_cache_key": True,
+        }
+        if training:
+            functorch_patch["force_non_lazy_backward_lowering"] = True
+        stack = contextlib.ExitStack()
+        stack.enter_context(functorch_config.patch(functorch_patch))
+        # allow_empty_graphs keeps an empty graph as a compiled frame so its
+        # guards reach the artifact. It also extends the lifetime of objects the
+        # frame holds: with it on, a weakref callback on a value the frame
+        # captured does not fire when the caller drops its reference
+        # (test/dynamo/test_repros.py ReproTests.test_weakref_callback).
+        try:
+            stack.enter_context(torch._dynamo.config.patch(allow_empty_graphs=True))
+        except BaseException:
+            stack.close()
+            raise
+        _CAPTURE_CONFIG_STACK.set(stack)
+    _CAPTURE_CONFIG_DEPTH.set(depth + 1)
+    try:
+        yield
+    finally:
+        remaining = _CAPTURE_CONFIG_DEPTH.get() - 1
+        _CAPTURE_CONFIG_DEPTH.set(remaining)
+        if remaining == 0:
+            stack = _CAPTURE_CONFIG_STACK.get()
+            _CAPTURE_CONFIG_STACK.set(None)
+            if stack is not None:
+                stack.close()
+
+
+class _AllowEmptyGraphsCallback(CatchErrorsWrapper):
+    """The package's Dynamo callback, compiling its frames with allow_empty_graphs.
+
+    An uncovered no-op branch must become a guarded variant rather than Dynamo's
+    ordinary eager-only SkipFrame, or one fallback call permanently skips that
+    frame for the rest of the process. Patched here as well as in
+    _capture_config so the package's own frames get it even when the callback
+    runs outside a capture-config scope.
+    """
+
+    def __call__(
+        self,
+        frame: DynamoFrameType,
+        cache_entry: CacheEntry | None,
+        frame_state: dict[str, int | FrameStateSizeEntry],
+    ) -> ConvertFrameReturn:
+        revert = _ALLOW_EMPTY_GRAPHS()
+        try:
+            return super().__call__(frame, cache_entry, frame_state)
+        finally:
+            revert()
+
+
+def _compose_with_default(
+    user: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]],
+) -> Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]:
+    """AND a caller's filter with the default rather than replacing it.
+
+    ``default_guard_filter_fn`` is not a default in the "sensible starting point"
+    sense -- it is what drops the identity guards that CANNOT be serialized at
+    all. Replacing it means a caller who wanted to drop three of their own guards
+    silently re-admits every unserializable one, and the failure surfaces as
+    "ID_MATCH guard cannot be serialized" in frames that have nothing to do with
+    their filter. A custom filter can only ever want to drop MORE, so composing
+    is the only reading that makes sense.
+    """
+
+    def composed(entries: Sequence[GuardFilterEntry]) -> Sequence[bool]:
+        base = default_guard_filter_fn(entries)
+        chosen = user(entries)
+        if len(chosen) != len(entries):
+            raise ValueError(
+                f"guard_filter_fn returned {len(chosen)} decisions for "
+                f"{len(entries)} guards; it must return one per entry."
+            )
+        return [bool(a) and bool(b) for a, b in zip(base, chosen)]
+
+    return composed
+
+
+def _entry_fn_of(fn: object) -> Callable[..., object]:
+    if isinstance(fn, torch.nn.Module):
+        forward = fn.forward
+        if not hasattr(forward, "__code__"):
+            raise TypeError(
+                f"{type(fn).__name__}.forward is a {type(forward).__name__}, which "
+                f"has no __code__ for Dynamo to capture or to load an artifact onto. "
+                f"Binding it in __init__ -- self.forward = functools.partial(...) -- "
+                f"shadows the class method and lands here; keep forward a method."
+            )
+        return forward
+    if not callable(fn):
+        raise TypeError(f"expected a callable or nn.Module, got {type(fn).__name__}")
+    if not hasattr(fn, "__code__"):
+        raise TypeError(
+            f"expected a function or nn.Module, got {type(fn).__name__}, which "
+            f"has no __code__ for Dynamo to capture or to load an artifact "
+            f"onto. Pass partial.func for a functools.partial, or obj.__call__ "
+            f"for an object that only defines __call__."
+        )
+    return fn  # type: ignore[return-value]
+
+
+class _PrecompileBackend:
+    """Give one explicit session its own Dynamo cache identity."""
+
+    def __init__(self, backend: str) -> None:
+        inner = torch._dynamo.lookup_backend(backend)
+        self._torchdynamo_orig_backend = inner
+        self.backend_ctx_ctor = getattr(
+            inner, "backend_ctx_ctor", contextlib.nullcontext
+        )
+
+    def __call__(self, gm: torch.fx.GraphModule, inputs: list[torch.Tensor]) -> Any:
+        return self._torchdynamo_orig_backend(gm, inputs)
+
+    def get_compiler_config(self) -> Any:
+        getter = getattr(self._torchdynamo_orig_backend, "get_compiler_config", None)
+        return None if getter is None else getter()
+
+
+def _optimize_isolated(
+    backend: _PrecompileBackend,
+    package: CompilePackage,
+    *,
+    recompile_limit: int,
+    dynamic: bool | None,
+    guard_filter_fn: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]] | None,
+) -> OptimizeContext:
+    from .eval_frame import OptimizeContext
+
+    optimize_ctx = torch._dynamo.optimize(
+        backend,
+        package=package,
+        recompile_limit=recompile_limit,
+        dynamic=dynamic,
+        guard_filter_fn=guard_filter_fn,
+        isolate_recompiles=True,
+    )
+    if not isinstance(optimize_ctx, OptimizeContext):
+        raise PackageError("torch.compiler.precompile requires Dynamo to be enabled")
+    callback = optimize_ctx.callback
+    if not isinstance(callback, CatchErrorsWrapper):
+        raise AssertionError(f"expected a CatchErrorsWrapper, got {type(callback)}")
+    optimize_ctx.callback = _AllowEmptyGraphsCallback(
+        callback._torchdynamo_orig_backend, callback.hooks
+    )
+    return optimize_ctx
+
+
+class PrecompileSession:
+    """
+    A caller-driven capture in progress. Enter as a context manager to get the
+    callable to exercise and invoke it with real inputs inside the block. The
+    compiled region stays alive for the whole block, so every call reuses the
+    variants the earlier ones produced.
+    """
+
+    def __init__(
+        self,
+        fn: Callable[..., object],
+        *,
+        backend: str = "inductor",
+        guard_filter_fn: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]
+        | None = None,
+        recompile_limit: int = 256,
+        dynamic: bool | None = None,
+        training: bool = False,
+    ) -> None:
+        self._fn = fn
+        self._backend = backend
+        # A training capture traces with grad on and lowers the backward
+        # eagerly, so the artifact carries AOTAutograd's CompiledFunction and
+        # calling .backward() on a served output runs precompiled code.
+        self._training = training
+        self._capture_errors: list[str] = []
+        self._recorded_exception_keys: set[tuple[type[BaseException], str]] = set()
+        self._guard_filter_fn = (
+            default_guard_filter_fn
+            if guard_filter_fn is None
+            else _compose_with_default(guard_filter_fn)
+        )
+        self._recompile_limit = recompile_limit
+        self._dynamic = dynamic
+        self._entry_fn = _entry_fn_of(fn)
+        # The guard filter rides on the optimize context rather than the
+        # package, so it applies to the live guards as well as the serialized
+        # ones, exactly as caching_precompile does today.
+        self._package = CompilePackage(self._entry_fn)
+        self._backend_artifacts: dict[_BackendId, Any] = {}
+        self._entered = False
+        self._optimized: Callable[..., object] | None = None
+        self._compiled: Callable[..., object] | None = None
+        self._state = threading.Condition()
+        self._active_calls = 0
+        self._closing = False
+        self._finished = False
+
+    def _take_backend_artifacts(self) -> None:
+        from torch._dynamo.output_graph import noop_graph_call
+        from torch._dynamo.precompile_context import (
+            EagerCacheArtifact,
+            PrecompileContext,
+        )
+
+        for backend_id in self._package.cache_entry().backend_ids:
+            artifact = PrecompileContext.take_artifact(backend_id)
+            if artifact is not None:
+                self._backend_artifacts[backend_id] = artifact
+            elif self._package.cached_backends.get(backend_id) is noop_graph_call:
+                # output_graph short-circuits an empty graph to noop_graph_call
+                # without filing anything under its id, which the bytecode still
+                # names. Record the no-op so the served frame dispatches to it
+                # rather than running eager. Here rather than in
+                # _collect_backends: teardown clears cached_backends first.
+                self._backend_artifacts[backend_id] = EagerCacheArtifact(
+                    key=backend_id, content=noop_graph_call
+                )
+
+    def _record_capture_error(self, error: BaseException) -> None:
+        message = str(error)
+        key = (type(error), message)
+        if key in self._recorded_exception_keys:
+            return
+        self._recorded_exception_keys.add(key)
+        self._capture_errors.append(f"{type(error).__name__}: {message}")
+
+    def _release(self) -> None:
+        # The compiled variants stay in the entry's ordinary Dynamo cache, as
+        # they would after torch.compile; clearing them per capture needs the
+        # region-scoped cache entries that are not part of this build. The
+        # eager backends stay until the render collects them.
+        self._optimized = None
+        if self._backend != "eager":
+            self._package.cached_backends.clear()
+
+    def _call(self, *args: object, **kwargs: object) -> object:
+        with self._state:
+            if self._compiled is None or self._closing:
+                raise RuntimeError("PrecompileSession is not active")
+            compiled = self._compiled
+            self._active_calls += 1
+        try:
+            with _capture_config(self._training):
+                result = compiled(*args, **kwargs)
+        except BaseException as e:
+            self._record_capture_error(e)
+            raise
+        finally:
+            with self._state:
+                self._active_calls -= 1
+                if self._active_calls == 0:
+                    self._state.notify_all()
+        return result
+
+    def __enter__(self) -> Callable[..., object]:
+        if self._finished:
+            raise RuntimeError("PrecompileSession cannot be re-entered")
+        if self._entered:
+            raise PackageError(
+                "PrecompileSession is already active: a session runs one capture "
+                "block at a time, so serialize concurrent entries."
+            )
+        # The grad-mode/config patch is per call, in _call, not block-level:
+        # user code between calls (optimizer.step, data loading) must run in
+        # the ambient mode, not the capture's.
+        self._entered = True
+        try:
+            if self._optimized is None:
+                backend_obj = _PrecompileBackend(self._backend)
+                optimize_ctx = _optimize_isolated(
+                    backend_obj,
+                    self._package,
+                    recompile_limit=self._recompile_limit,
+                    dynamic=self._dynamic,
+                    guard_filter_fn=self._guard_filter_fn,
+                )
+                self._optimized = optimize_ctx(self._fn)
+            self._compiled = self._optimized
+        except BaseException as e:
+            self._record_capture_error(e)
+            # A __enter__ that raises never gets its __exit__, so without this
+            # the session is wedged: the block reads as still open.
+            self._entered = False
+            self._compiled = None
+            # Drain in-flight calls FIRST, before any teardown, exactly as
+            # __exit__ does: a concurrent call can still be compiling against a
+            # borrowed cache entry, and teardown mutates state it reads. The
+            # cleanup chain sits in the drain's finally so an interrupt raised
+            # out of wait() (e.g. KeyboardInterrupt) still releases the session
+            # rather than leaking it until process exit.
+            try:
+                with self._state:
+                    self._closing = True
+                    while self._active_calls:
+                        self._state.wait()
+            finally:
+                # _closing marks a drain in progress, so both teardown paths
+                # clear it once their own drain is done.
+                self._closing = False
+                try:
+                    self._take_backend_artifacts()
+                except BaseException as teardown:
+                    self._record_capture_error(teardown)
+                finally:
+                    self._release()
+                    self._finished = True
+                    with self._state:
+                        self._state.notify_all()
+            raise
+        return self._call
+
+    def __exit__(self, *exc: object) -> None:
+        if isinstance(exc[1], BaseException):
+            self._record_capture_error(exc[1])
+        with self._state:
+            self._closing = True
+            try:
+                while self._active_calls:
+                    self._state.wait()
+            except BaseException:
+                # An interrupted drain leaves the session open, so _closing goes
+                # back to False here and in __enter__'s error path alike.
+                self._closing = False
+                self._state.notify_all()
+                raise
+            self._closing = False
+            entered = self._entered
+            self._entered = False
+            self._compiled = None
+        if entered:
+            try:
+                self._take_backend_artifacts()
+            except BaseException as teardown:
+                # Recorded, never raised: a teardown failure must not replace
+                # the exception the caller's block is already propagating, and
+                # the capture errors are what a render gates on.
+                self._record_capture_error(teardown)
+            finally:
+                self._release()
+                self._finished = True
+                with self._state:
+                    self._state.notify_all()
+        self._recorded_exception_keys.clear()
+
+
+def precompile_capture(
+    fn: Callable[..., object],
+    *,
+    backend: str = "inductor",
+    guard_filter_fn: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]
+    | None = None,
+    recompile_limit: int = 256,
+    dynamic: bool | None = None,
+    training: bool = False,
+) -> PrecompileSession:
+    r"""Begin capturing ``fn`` into a multi-graph artifact.
+
+    ``recompile_limit`` defaults well above Dynamo's usual 8 because a
+    precompile deliberately wants one compiled variant per condition, whereas
+    the normal limit exists to catch runaway recompilation. Nothing raises the
+    ambient ``accumulated_recompile_limit`` (256), which Dynamo checks first and
+    counts across every isolated region on the code object, so that ceiling --
+    not this argument -- is the effective cap above 256 variants.
+
+    The capture is caller-driven: enter the session to get a callable, invoke it
+    exactly as you would ``fn`` inside the ``with`` body, and the calls fold into
+    the artifact in the ambient grad mode. The compiled region stays alive for
+    the whole block, so every call reuses the variants the earlier ones
+    produced.
+
+    Runtime guards remain intact during capture. ``guard_filter_fn`` applies
+    only to the serialized guard state, so every call observes the same
+    recompilation behavior as ordinary ``torch.compile``.
+    """
+    return PrecompileSession(
+        fn,
+        backend=backend,
+        guard_filter_fn=guard_filter_fn,
+        recompile_limit=recompile_limit,
+        dynamic=dynamic,
+        training=training,
     )

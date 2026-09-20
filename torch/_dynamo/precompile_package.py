@@ -1434,9 +1434,10 @@ def _missing_backends_message(
 class PrecompileSession:
     """
     A caller-driven capture in progress. Enter as a context manager to get the
-    callable to exercise and invoke it with real inputs inside the block. The
-    compiled region stays alive for the whole block, so every call reuses the
-    variants the earlier ones produced.
+    callable to exercise, invoke it with real inputs inside the block, and
+    ``save()`` to write the artifact -- repeatedly to checkpoint mid-block, and
+    once more on exit. The compiled region stays alive for the whole block, so
+    every call reuses the variants the earlier ones produced.
     """
 
     def __init__(
@@ -2163,7 +2164,9 @@ def precompile_capture(
 
     Runtime guards remain intact during capture. ``guard_filter_fn`` applies
     only to the serialized guard state, so every call observes the same
-    recompilation behavior as ordinary ``torch.compile``.
+    recompilation behavior as ordinary ``torch.compile``. ``save()`` refuses
+    the risky subset by default rather than every drop, and a drop a custom
+    filter adds beyond the default's counts as risky.
     """
     return PrecompileSession(
         fn,

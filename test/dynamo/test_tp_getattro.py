@@ -511,6 +511,61 @@ class TpGetattroTests(torch._dynamo.test_case.TestCase):
         result = torch.compile(fn, backend="eager", fullgraph=True)()
         self.assertEqual(result, 10)
 
+    def test_staticmethod_constructor_func_attr(self):
+        def fn():
+            def f():
+                pass
+
+            return staticmethod(f).__func__ is f
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
+    def test_classmethod_constructor_func_attr(self):
+        def fn():
+            def f(cls):
+                pass
+
+            return classmethod(f).__func__ is f
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
+    def test_staticmethod_constructor_with_builtin(self):
+        def fn():
+            return staticmethod(len).__func__ is len
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
+    def test_classmethod_constructor_reconstruct(self):
+        """The descriptor must survive being returned out of the graph."""
+
+        def fn():
+            def f():
+                return 1
+
+            return staticmethod(f)
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertIsInstance(result, staticmethod)
+        self.assertEqual(result.__func__(), 1)
+
+    def test_staticmethod_constructor_of_opaque_callable(self):
+        """A callable with no Python constant form still wraps and unwraps."""
+
+        class Callable:
+            def __call__(self):
+                return 1
+
+        obj = Callable()
+
+        def fn():
+            return staticmethod(obj).__func__ is obj
+
+        result = torch.compile(fn, backend="eager", fullgraph=True)()
+        self.assertTrue(result)
+
     def test_property_setter(self):
         class MyObj:
             def __init__(self):

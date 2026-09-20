@@ -4939,13 +4939,17 @@ class StaticMethodVariable(VariableTracker):
 
     def __init__(
         self,
-        descriptor: staticmethod,  # type: ignore[type-arg]
+        descriptor: staticmethod | None = None,  # type: ignore[type-arg]
+        func: VariableTracker | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.descriptor = descriptor
+        self.func = func
 
     def __repr__(self) -> str:
+        if self.descriptor is None:
+            return f"StaticMethodVariable({self.func})"
         func_name = getattr(self.descriptor.__func__, "__name__", "?")
         return f"StaticMethodVariable({func_name})"
 
@@ -4953,7 +4957,21 @@ class StaticMethodVariable(VariableTracker):
         return staticmethod
 
     def as_python_constant(self) -> staticmethod:  # type: ignore[type-arg]
-        return self.descriptor
+        # Built from `func` on demand: converting eagerly would make
+        # `staticmethod(callable)` fail for callables that have no Python
+        # constant form, even though nothing here needs one.
+        if self.descriptor is not None:
+            return self.descriptor
+        if self.func is None:
+            raise AssertionError(f"{self} wraps neither a descriptor nor a callable")
+        return staticmethod(self.func.as_python_constant())
+
+    def tp_getattro_impl(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        if name == "__func__" and self.func is not None:
+            return self.func
+        return super().tp_getattro_impl(tx, name)
 
     def tp_descr_get_impl(
         self,
@@ -4963,8 +4981,25 @@ class StaticMethodVariable(VariableTracker):
     ) -> VariableTracker:
         # sm_descr_get returns sm->sm_callable unconditionally.
         # https://github.com/python/cpython/blob/3.13/Objects/funcobject.c#L1418-L1428
+        if self.func is not None:
+            return self.func
+        if self.descriptor is None:
+            raise AssertionError(f"{self} wraps neither a descriptor nor a callable")
         func_source = AttrSource(self.source, "__func__") if self.source else None
         return VariableTracker.build(tx, self.descriptor.__func__, func_source)
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        func = self.func
+        if func is None:
+            return super().reconstruct(codegen)
+        # Rebuild the descriptor around the traced callable rather than
+        # reconstructing `self.descriptor`, whose wrapped function may be an
+        # unrealized closure.
+        codegen.add_push_null(
+            lambda: codegen.load_import_from("builtins", "staticmethod")
+        )
+        codegen(func)
+        codegen.extend_output(create_call_function(1, False))
 
 
 class ClassMethodVariable(VariableTracker):
@@ -4984,13 +5019,17 @@ class ClassMethodVariable(VariableTracker):
 
     def __init__(
         self,
-        descriptor: classmethod,  # type: ignore[type-arg]
+        descriptor: classmethod | None = None,  # type: ignore[type-arg]
+        func: VariableTracker | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.descriptor = descriptor
+        self.func = func
 
     def __repr__(self) -> str:
+        if self.descriptor is None:
+            return f"ClassMethodVariable({self.func})"
         func_name = getattr(self.descriptor.__func__, "__name__", "?")
         return f"ClassMethodVariable({func_name})"
 
@@ -4998,7 +5037,19 @@ class ClassMethodVariable(VariableTracker):
         return classmethod
 
     def as_python_constant(self) -> classmethod:  # type: ignore[type-arg]
-        return self.descriptor
+        # See StaticMethodVariable.as_python_constant.
+        if self.descriptor is not None:
+            return self.descriptor
+        if self.func is None:
+            raise AssertionError(f"{self} wraps neither a descriptor nor a callable")
+        return classmethod(self.func.as_python_constant())
+
+    def tp_getattro_impl(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        if name == "__func__" and self.func is not None:
+            return self.func
+        return super().tp_getattro_impl(tx, name)
 
     def tp_descr_get_impl(
         self,
@@ -5008,6 +5059,19 @@ class ClassMethodVariable(VariableTracker):
     ) -> VariableTracker:
         # cm_descr_get binds the wrapped function to the class.
         # https://github.com/python/cpython/blob/3.13/Objects/funcobject.c#L1215-L1227
+        func = self.func
+        if func is not None:
+            if not isinstance(func, UserFunctionVariable):
+                unimplemented(
+                    gb_type="classmethod of non-Python function",
+                    context=f"tp_descr_get {self} on {owner}",
+                    explanation="Dynamo can only bind a classmethod wrapping a "
+                    "Python function to its class.",
+                    hints=[*graph_break_hints.SUPPORTABLE],
+                )
+            return UserMethodVariable(func, owner)
+        if self.descriptor is None:
+            raise AssertionError(f"{self} wraps neither a descriptor nor a callable")
         func_source = AttrSource(self.source, "__func__") if self.source else None
         bound_source = (
             AttrSource(owner.source, self.descriptor.__func__.__name__)
@@ -5023,6 +5087,17 @@ class ClassMethodVariable(VariableTracker):
             owner,
             source=bound_source,
         )
+
+    def reconstruct(self, codegen: "PyCodegen") -> None:
+        func = self.func
+        if func is None:
+            return super().reconstruct(codegen)
+        # See StaticMethodVariable.reconstruct.
+        codegen.add_push_null(
+            lambda: codegen.load_import_from("builtins", "classmethod")
+        )
+        codegen(func)
+        codegen.extend_output(create_call_function(1, False))
 
 
 class MemberDescriptorVariable(DescriptorVariable):

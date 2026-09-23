@@ -1899,6 +1899,12 @@ class CppVecOverrides(CppOverrides):
                 raise AssertionError("expected isinstance(csevar, CppCSEVariable)")
             csevar.is_vec = True
         elif result.is_vec:
+            if dtype == torch.bool:
+                # other_code_vec is a VecMask<float, N>, but a vectorized bool can
+                # be a VecMask of another type, e.g. from an int64 comparison or a
+                # bitwise op on bools.
+                n = V.kernel._get_num_vectors(torch.float)
+                body_code_vec = f"inductor_vec_mask_cast<float,{n}>({body_code})"
             csevar = V.kernel.cse.generate(
                 V.kernel.compute, f"{mask} ? {body_code_vec} : {other_code_vec}"
             )

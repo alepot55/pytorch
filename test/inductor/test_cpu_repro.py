@@ -3749,6 +3749,27 @@ class CPUReproTests(TestCase):
                 metrics.reset()
                 self.common(fn, (a, b))
 
+    @requires_vectorization
+    def test_masked_load_bool_non_float_vec_mask(self):
+        # shift() loads a bool that is not a VecMask<float, N> under a scalar mask.
+        def shift(y):
+            y[1:] = y[:-1].clone()
+            return y
+
+        def cmp_int64(a, b):
+            return shift(a > 0)
+
+        def bitwise(a, b):
+            return shift(b ^ (a > 0))
+
+        a = torch.randint(-5, 5, (4, 64))
+        b = torch.rand(4, 64) > 0.5
+        for fn in (cmp_int64, bitwise):
+            torch._dynamo.reset()
+            metrics.reset()
+            self.common(fn, (a, b))
+            check_metrics_vec_kernel_count(1)
+
     def test_torch_logit(self):
         # fix https://github.com/pytorch/pytorch/issues/145379
         def fn(*args):

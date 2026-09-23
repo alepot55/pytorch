@@ -2231,9 +2231,14 @@ class GraphLowering(torch.fx.Interpreter):
                                 ir.get_stride_order(n.meta["val"].stride()),
                                 allow_padding=True,
                             )
+                        # A graph input has a fixed layout, so this would be a
+                        # channels-last copy, and every user of the input,
+                        # an in-place update of it included, would get the
+                        # copy. The convolution makes its own copy.
                         if (
                             user.target in need_fixed_channels_last_layout
                             and n is user.args[0]
+                            and n.op != "placeholder"
                         ):
                             result = ir.ExternKernel.require_stride_order(
                                 result,

@@ -225,6 +225,34 @@ class OptimizeForInferenceTemplate(TestCase):
             self.assertEqual(out_eager, out_comp)
             self.assertEqual(out_eager2, out_comp2)
 
+    def test_conv_input_mutated_in_place(self):
+        # The input of the convolution is also written in place: the update
+        # must reach the input, not a channels-last copy of it.
+        class Mod(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.conv = torch.nn.Conv2d(4, 4, 3, padding=1, bias=False)
+
+            def forward(self, x):
+                x.copy_(self.conv(x))
+                return x
+
+        class ModSlice(Mod):
+            def forward(self, x):
+                x[1:] = self.conv(x)[:-1]
+                return x
+
+        for cls in (Mod, ModSlice):
+            with torch.no_grad():
+                mod = cls().eval().to(self.device)
+                x = torch.rand(4, 4, 6, 6, device=self.device)
+                x_eager, x_comp = x.clone(), x.clone()
+                out_eager = mod(x_eager)
+                torch._dynamo.reset()
+                out_comp = torch.compile(mod)(x_comp)
+                self.assertEqual(out_eager, out_comp)
+                self.assertEqual(x_eager, x_comp)
+
     def test_aliased_param_return(self):
         class Mod(torch.nn.Module):
             def __init__(self) -> None:

@@ -2665,6 +2665,17 @@ class CPUReproTests(TestCase):
                     metrics.reset()
                     self.common(fn, (x, two))
 
+    @config.patch("cpp.simdlen", 256)
+    @requires_vectorization
+    def test_int64_vec_mul_overflow_wraps(self):
+        # https://github.com/pytorch/pytorch/issues/198606
+        # simdlen 256 takes the AVX2 path, where the int64 multiply is emulated,
+        # also on AVX-512 machines. x * x wraps to -2**63 + 1.
+        def fn(x):
+            return (x * x) % 72, (x * x) // 72
+
+        self.common(fn, (torch.full((67,), 2**62 + 1, dtype=torch.int64),))
+
     def test_int_div(self):
         def fn(x, y):
             s3 = x.size(1)

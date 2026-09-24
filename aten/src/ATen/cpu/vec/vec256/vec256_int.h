@@ -1181,15 +1181,15 @@ Vectorized<int64_t> inline emulate(
 // This could be implemented more efficiently using epi32 instructions
 // This is also technically avx compatible, but then we'll need AVX
 // code for add as well.
-// Note: intentionally ignores undefined behavior like (-lowest * -1).
+// Multiply as uint64_t so overflow wraps like _mm512_mullo_epi64 instead of UB.
 template <>
 Vectorized<int64_t> inline operator*(
     const Vectorized<int64_t>& a,
     const Vectorized<int64_t>& b) {
-  return emulate(
-      a, b, [](int64_t a_point, int64_t b_point) __ubsan_ignore_undefined__ {
-        return a_point * b_point;
-      });
+  return emulate(a, b, [](int64_t a_point, int64_t b_point) {
+    return static_cast<int64_t>(
+        static_cast<uint64_t>(a_point) * static_cast<uint64_t>(b_point));
+  });
 }
 
 template <>
